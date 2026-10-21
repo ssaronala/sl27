@@ -1,29 +1,32 @@
 import asyncio
+import json
 import logging
+import os
+import re
 import sqlite3
 from datetime import datetime, timedelta
 from html import escape
 
+import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 
 # ============================================================
 # НАСТРОЙКИ
 # ============================================================
-
-import os
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
@@ -33,6 +36,10 @@ ADMIN_GROUP_ID = -1004380534371
 # ОФИЦИАЛЬНЫЙ КАНАЛ
 OFFICIAL_CHANNEL_ID = -1004361362556
 OFFICIAL_CHANNEL_LINK = "https://t.me/SLSleaguer"
+
+# КАНАЛ «СВОБОДНЫЕ АГЕНТЫ И ТРАНСФЕРЫ»
+# !!! ВСТАВЬТЕ СЮДА ID ВТОРОГО КАНАЛА (бот должен быть админом канала) !!!
+TRANSFERS_CHANNEL_ID = -1004240688431
 
 # ОСНОВНЫЕ АДМИНЫ
 CREATOR_ID = 7762496102
@@ -46,6 +53,19 @@ WITHDRAWAL_TIMEOUT_MINUTES = 10
 
 # 5 часов на результат
 RESULT_TIMEOUT_HOURS = 5
+
+# Максимум игроков в составе клуба (без владельца)
+MAX_CLUB_PLAYERS = 18
+
+# Вопросы для «Заявки на получение клуба».
+# ПОСЛЕДНИЙ вопрос всегда считается названием клуба.
+APPLICATION_QUESTIONS = [
+    "Сколько вам лет?",
+    "Есть ли у вас опыт управления клубом или командой? Опишите кратко.",
+    "Сколько времени в неделю вы готовы уделять клубу и матчам?",
+    "Почему именно вы должны стать владельцем клуба? Чем будете полезны лиге?",
+    "Какой клуб вы хотите взять?",
+]
 
 
 # ============================================================
@@ -64,33 +84,19 @@ logging.basicConfig(
 
 bot = Bot(
     token=BOT_TOKEN,
-    default=DefaultBotProperties(
-        parse_mode=ParseMode.HTML
-    )
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
 )
 
-dp = Dispatcher(
-    storage=MemoryStorage()
-)
+dp = Dispatcher(storage=MemoryStorage())
 
 
 # ============================================================
 # DATABASE
 # ============================================================
 
-db = sqlite3.connect(
-    DB_NAME,
-    check_same_thread=False
-)
-
+db = sqlite3.connect(DB_NAME, check_same_thread=False)
 db.row_factory = sqlite3.Row
-
 cur = db.cursor()
-
-
-# ============================================================
-# USERS
-# ============================================================
 
 cur.execute("""
 CREATE TABLE IF NOT EXISTS users (
@@ -101,11 +107,6 @@ CREATE TABLE IF NOT EXISTS users (
 )
 """)
 
-
-# ============================================================
-# SCHEDULES
-# ============================================================
-
 cur.execute("""
 CREATE TABLE IF NOT EXISTS schedules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -113,11 +114,6 @@ CREATE TABLE IF NOT EXISTS schedules (
     created_at TEXT
 )
 """)
-
-
-# ============================================================
-# RESULTS
-# ============================================================
 
 cur.execute("""
 CREATE TABLE IF NOT EXISTS results (
@@ -127,11 +123,6 @@ CREATE TABLE IF NOT EXISTS results (
 )
 """)
 
-
-# ============================================================
-# MVP
-# ============================================================
-
 cur.execute("""
 CREATE TABLE IF NOT EXISTS mvps (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -140,11 +131,6 @@ CREATE TABLE IF NOT EXISTS mvps (
     created_at TEXT
 )
 """)
-
-
-# ============================================================
-# QUESTIONS
-# ============================================================
 
 cur.execute("""
 CREATE TABLE IF NOT EXISTS questions (
@@ -158,11 +144,6 @@ CREATE TABLE IF NOT EXISTS questions (
 )
 """)
 
-
-# ============================================================
-# WITHDRAWALS
-# ============================================================
-
 cur.execute("""
 CREATE TABLE IF NOT EXISTS withdrawals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -174,11 +155,6 @@ CREATE TABLE IF NOT EXISTS withdrawals (
     created_at TEXT
 )
 """)
-
-
-# ============================================================
-# WITHDRAWAL PLAYERS
-# ============================================================
 
 cur.execute("""
 CREATE TABLE IF NOT EXISTS withdrawal_players (
@@ -199,11 +175,6 @@ CREATE TABLE IF NOT EXISTS withdrawal_players (
 )
 """)
 
-
-# ============================================================
-# SUBMISSIONS
-# ============================================================
-
 cur.execute("""
 CREATE TABLE IF NOT EXISTS submissions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -218,25 +189,91 @@ CREATE TABLE IF NOT EXISTS submissions (
 )
 """)
 
+# ---------------- НОВОЕ ----------------
+
+# Клубы. owner_id = NULL -> у клуба нет владельца
+cur.execute("""
+CREATE TABLE IF NOT EXISTS clubs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    owner_id INTEGER,
+    created_at TEXT
+)
+""")
+
+# Состав клуба (владелец сюда не входит)
+cur.execute("""
+CREATE TABLE IF NOT EXISTS club_players (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    club_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL UNIQUE,
+    joined_at TEXT
+)
+""")
+
+# Предложения контракта (/sign)
+cur.execute("""
+CREATE TABLE IF NOT EXISTS sign_offers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    club_id INTEGER NOT NULL,
+    from_user_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    status TEXT DEFAULT 'pending',
+    created_at TEXT
+)
+""")
+
+# Заявки «Свободный агент»
+cur.execute("""
+CREATE TABLE IF NOT EXISTS free_agents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    username TEXT,
+    roblox_nick TEXT,
+    ps TEXT,
+    status TEXT DEFAULT 'pending',
+    reject_reason TEXT,
+    admin_message_id INTEGER,
+    created_at TEXT
+)
+""")
+
+# Заявки «Получение клуба»
+cur.execute("""
+CREATE TABLE IF NOT EXISTS club_applications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    username TEXT,
+    roblox_nick TEXT,
+    answers TEXT,
+    club TEXT,
+    status TEXT DEFAULT 'pending',
+    reject_reason TEXT,
+    admin_message_id INTEGER,
+    created_at TEXT
+)
+""")
+
+# Запросы причины отказа в админ-группе
+cur.execute("""
+CREATE TABLE IF NOT EXISTS reason_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prompt_message_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    target_id INTEGER NOT NULL,
+    done INTEGER DEFAULT 0,
+    created_at TEXT
+)
+""")
+
 
 # ============================================================
 # МИГРАЦИЯ СТАРОЙ БАЗЫ
 # ============================================================
 
-def ensure_column(
-    table_name,
-    column_name,
-    definition
-):
-    columns = cur.execute(
-        f"PRAGMA table_info({table_name})"
-    ).fetchall()
-
-    existing = [
-        row["name"]
-        for row in columns
-    ]
-
+def ensure_column(table_name, column_name, definition):
+    columns = cur.execute(f"PRAGMA table_info({table_name})").fetchall()
+    existing = [row["name"] for row in columns]
     if column_name not in existing:
         cur.execute(
             f"ALTER TABLE {table_name} "
@@ -244,48 +281,18 @@ def ensure_column(
         )
 
 
-ensure_column(
-    "withdrawal_players",
-    "club_number",
-    "INTEGER DEFAULT 1"
-)
+ensure_column("withdrawal_players", "club_number", "INTEGER DEFAULT 1")
+ensure_column("withdrawal_players", "stage", "TEXT DEFAULT 'pending'")
+ensure_column("withdrawal_players", "accepted_at", "TEXT")
+ensure_column("withdrawal_players", "vip_sent_at", "TEXT")
+ensure_column("withdrawal_players", "result_deadline", "TEXT")
+ensure_column("withdrawal_players", "result_sent", "INTEGER DEFAULT 0")
+ensure_column("withdrawal_players", "tp_reason", "TEXT")
 
-ensure_column(
-    "withdrawal_players",
-    "stage",
-    "TEXT DEFAULT 'pending'"
-)
-
-ensure_column(
-    "withdrawal_players",
-    "accepted_at",
-    "TEXT"
-)
-
-ensure_column(
-    "withdrawal_players",
-    "vip_sent_at",
-    "TEXT"
-)
-
-ensure_column(
-    "withdrawal_players",
-    "result_deadline",
-    "TEXT"
-)
-
-ensure_column(
-    "withdrawal_players",
-    "result_sent",
-    "INTEGER DEFAULT 0"
-)
-
-ensure_column(
-    "withdrawal_players",
-    "tp_reason",
-    "TEXT"
-)
-
+# Roblox-привязка игроков
+ensure_column("users", "roblox_nick", "TEXT")
+ensure_column("users", "roblox_id", "INTEGER")
+ensure_column("users", "verified", "INTEGER DEFAULT 0")
 
 db.commit()
 
@@ -298,6 +305,11 @@ class UserState(StatesGroup):
     waiting_question = State()
     waiting_vip = State()
     waiting_result = State()
+    # новое
+    waiting_roblox_nick = State()
+    waiting_roblox_confirm = State()
+    waiting_ps = State()
+    waiting_app_answer = State()
 
 
 class AdminState(StatesGroup):
@@ -318,20 +330,14 @@ def now():
 
 
 def now_string():
-    return now().strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
+    return now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def parse_datetime(value):
     if not value:
         return None
-
     try:
-        return datetime.strptime(
-            value,
-            "%Y-%m-%d %H:%M:%S"
-        )
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
     except Exception:
         return None
 
@@ -339,259 +345,296 @@ def parse_datetime(value):
 def safe(value):
     if value is None:
         return ""
-
-    return escape(
-        str(value)
-    )
+    return escape(str(value))
 
 
 def get_user_name(user):
     if user.username:
         return f"@{user.username}"
-
-    return (
-        user.first_name
-        or "Игрок"
-    )
+    return user.first_name or "Игрок"
 
 
-# ============================================================
-# SAVE USER
-# ============================================================
+def parse_args(message: Message) -> str:
+    """Текст после команды: '/sign Nick' -> 'Nick'."""
+    parts = (message.text or "").split(maxsplit=1)
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
+def _upsert_user(user):
+    cur.execute("""
+        INSERT INTO users (user_id, username, first_name, created_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id)
+        DO UPDATE SET
+            username = excluded.username,
+            first_name = excluded.first_name
+    """, (user.id, user.username, user.first_name, now_string()))
+    db.commit()
+
 
 def save_user(message: Message):
+    _upsert_user(message.from_user)
 
-    user = message.from_user
 
-    cur.execute("""
-        INSERT INTO users (
-            user_id,
-            username,
-            first_name,
-            created_at
+def save_callback_user(callback: CallbackQuery):
+    _upsert_user(callback.from_user)
+
+
+# ---------------- пользователи / клубы ----------------
+
+def get_db_user(user_id):
+    return cur.execute(
+        "SELECT * FROM users WHERE user_id = ?", (user_id,)
+    ).fetchone()
+
+
+def is_verified(user_id) -> bool:
+    row = cur.execute(
+        "SELECT verified FROM users WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    return bool(row and row["verified"])
+
+
+def find_user_by_nick(nick):
+    return cur.execute("""
+        SELECT * FROM users
+        WHERE verified = 1 AND roblox_nick = ? COLLATE NOCASE
+    """, (nick,)).fetchone()
+
+
+def get_club_by_name(name):
+    return cur.execute(
+        "SELECT * FROM clubs WHERE name = ? COLLATE NOCASE", (name,)
+    ).fetchone()
+
+
+def get_owned_club(user_id):
+    return cur.execute(
+        "SELECT * FROM clubs WHERE owner_id = ? LIMIT 1", (user_id,)
+    ).fetchone()
+
+
+def get_player_club(user_id):
+    return cur.execute("""
+        SELECT c.* FROM club_players cp
+        JOIN clubs c ON c.id = cp.club_id
+        WHERE cp.user_id = ?
+    """, (user_id,)).fetchone()
+
+
+def get_user_club(user_id):
+    """(club, role): role = 'owner' / 'player' / None"""
+    club = get_owned_club(user_id)
+    if club:
+        return club, "owner"
+    club = get_player_club(user_id)
+    if club:
+        return club, "player"
+    return None, None
+
+
+def person_label(row):
+    """Ник в Roblox + @username (уже без escape)."""
+    if not row:
+        return "—"
+    nick = row["roblox_nick"] or row["first_name"] or "Игрок"
+    if row["username"]:
+        return f"{nick} (@{row['username']})"
+    return nick
+
+
+async def safe_send(chat_id, text, **kwargs) -> bool:
+    try:
+        await bot.send_message(chat_id, text, **kwargs)
+        return True
+    except Exception as e:
+        logging.warning("Не удалось отправить сообщение %s: %s", chat_id, e)
+        return False
+
+
+async def publish_to_transfers(text) -> bool:
+    if not TRANSFERS_CHANNEL_ID:
+        logging.warning("TRANSFERS_CHANNEL_ID не задан — пост не опубликован")
+        return False
+    try:
+        await bot.send_message(TRANSFERS_CHANNEL_ID, text)
+        return True
+    except Exception as e:
+        logging.error("Ошибка публикации в канал трансферов: %s", e)
+        return False
+
+
+async def set_user_state(user_id: int, state):
+    """Поставить FSM-состояние ДРУГОМУ пользователю (в его ЛС)."""
+    key = StorageKey(bot_id=bot.id, chat_id=user_id, user_id=user_id)
+    await FSMContext(storage=dp.storage, key=key).set_state(state)
+
+
+async def require_verified(callback: CallbackQuery) -> bool:
+    if is_verified(callback.from_user.id):
+        return True
+    await callback.answer(
+        "❌ Сначала пройдите регистрацию: напишите боту /start",
+        show_alert=True
+    )
+    return False
+
+
+async def show_screen(callback: CallbackQuery, text, kb=None):
+    """Редактирует сообщение, а если нельзя (например, фото) — шлёт новое."""
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb)
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+
+
+def back_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")
+    ]])
+
+
+def done_keyboard(text):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=text, callback_data="already_done")
+    ]])
+
+
+async def mark_admin_message(message_id, text):
+    if not message_id:
+        return
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=ADMIN_GROUP_ID,
+            message_id=message_id,
+            reply_markup=done_keyboard(text)
         )
-        VALUES (?, ?, ?, ?)
-
-        ON CONFLICT(user_id)
-        DO UPDATE SET
-            username = excluded.username,
-            first_name = excluded.first_name
-    """, (
-        user.id,
-        user.username,
-        user.first_name,
-        now_string()
-    ))
-
-    db.commit()
-
-
-def save_callback_user(
-    callback: CallbackQuery
-):
-
-    user = callback.from_user
-
-    cur.execute("""
-        INSERT INTO users (
-            user_id,
-            username,
-            first_name,
-            created_at
-        )
-        VALUES (?, ?, ?, ?)
-
-        ON CONFLICT(user_id)
-        DO UPDATE SET
-            username = excluded.username,
-            first_name = excluded.first_name
-    """, (
-        user.id,
-        user.username,
-        user.first_name,
-        now_string()
-    ))
-
-    db.commit()
+    except Exception:
+        pass
 
 
 # ============================================================
 # ADMIN CHECK
 # ============================================================
 
-async def is_admin(
-    user_id: int
-) -> bool:
+async def is_admin(user_id: int) -> bool:
 
-    if user_id in (
-        CREATOR_ID,
-        ADMIN_ID
-    ):
+    if user_id in (CREATOR_ID, ADMIN_ID):
         return True
 
     try:
-
-        member = await bot.get_chat_member(
-            ADMIN_GROUP_ID,
-            user_id
-        )
-
-        return member.status in (
-            "administrator",
-            "creator"
-        )
+        member = await bot.get_chat_member(ADMIN_GROUP_ID, user_id)
+        return member.status in ("administrator", "creator")
 
     except Exception as e:
-
-        logging.warning(
-            "Ошибка проверки админа %s: %s",
-            user_id,
-            e
-        )
-
+        logging.warning("Ошибка проверки админа %s: %s", user_id, e)
         return False
+
+
+async def can_use_admin_command(message: Message) -> bool:
+    """Админ-команды: только в админ-группе или в ЛС у админа."""
+    if message.chat.id != ADMIN_GROUP_ID and message.chat.type != "private":
+        return False
+    return await is_admin(message.from_user.id)
 
 
 # ============================================================
 # MAIN MENU
 # ============================================================
 
-def main_menu():
+def build_main_menu(is_admin_user=False, has_club=False):
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📅 Расписание",
-                    callback_data="menu_schedule"
-                ),
-                InlineKeyboardButton(
-                    text="📊 Результаты",
-                    callback_data="menu_results"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🏆 MVP",
-                    callback_data="menu_mvp"
-                ),
-                InlineKeyboardButton(
-                    text="❓ Задать вопрос",
-                    callback_data="menu_question"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📢 Официальный канал",
-                    url=OFFICIAL_CHANNEL_LINK
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔧 Админ-панель",
-                    callback_data="menu_admin"
-                )
-            ]
-        ]
+    rows = [
+        [
+            InlineKeyboardButton(text="📅 Расписание", callback_data="menu_schedule"),
+            InlineKeyboardButton(text="📊 Результаты", callback_data="menu_results"),
+        ],
+        [
+            InlineKeyboardButton(text="🏆 MVP", callback_data="menu_mvp"),
+            InlineKeyboardButton(text="❓ Задать вопрос", callback_data="menu_question"),
+        ],
+        [
+            InlineKeyboardButton(
+                text="📝 Заявка на получение клуба",
+                callback_data="menu_club_app"
+            )
+        ],
+        [
+            InlineKeyboardButton(text="🆓 Свободный агент", callback_data="menu_agent"),
+            InlineKeyboardButton(text="👤 Мой профиль", callback_data="menu_profile"),
+        ],
+    ]
+
+    if has_club:
+        rows.append([
+            InlineKeyboardButton(text="🏟 Мой клуб", callback_data="menu_myclub")
+        ])
+
+    rows.append([
+        InlineKeyboardButton(text="📢 Официальный канал", url=OFFICIAL_CHANNEL_LINK)
+    ])
+
+    if is_admin_user:
+        rows.append([
+            InlineKeyboardButton(text="🔧 Админ-панель", callback_data="menu_admin")
+        ])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def main_menu_for(user_id: int):
+    club, _ = get_user_club(user_id)
+    return build_main_menu(
+        is_admin_user=await is_admin(user_id),
+        has_club=club is not None
     )
 
-
-# ============================================================
-# ADMIN MENU
-# ============================================================
 
 def admin_menu():
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📢 Создать отписку",
-                    callback_data="admin_withdrawal"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📅 Изменить расписание",
-                    callback_data="admin_schedule"
-                ),
-                InlineKeyboardButton(
-                    text="📊 Добавить результат",
-                    callback_data="admin_result"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🏆 Установить MVP",
-                    callback_data="admin_mvp"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📣 Сделать пост",
-                    callback_data="admin_post"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="❓ Вопросы игроков",
-                    callback_data="admin_questions"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Главное меню",
-                    callback_data="back_main"
-                )
-            ]
-        ]
-    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Создать отписку", callback_data="admin_withdrawal")],
+        [
+            InlineKeyboardButton(text="📅 Изменить расписание", callback_data="admin_schedule"),
+            InlineKeyboardButton(text="📊 Добавить результат", callback_data="admin_result"),
+        ],
+        [InlineKeyboardButton(text="🏆 Установить MVP", callback_data="admin_mvp")],
+        [InlineKeyboardButton(text="📣 Сделать пост", callback_data="admin_post")],
+        [InlineKeyboardButton(text="❓ Вопросы игроков", callback_data="admin_questions")],
+        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back_main")],
+    ])
 
 
 # ============================================================
 # ОТПИСКА — ДИЗАЙН
 # ============================================================
 
-def get_club_status(
-    withdrawal_id,
-    club_number
-):
+def get_club_status(withdrawal_id, club_number):
 
     row = cur.execute("""
         SELECT status
         FROM withdrawal_players
         WHERE withdrawal_id = ?
           AND club_number = ?
-          AND status IN (
-              'pending',
-              'accepted',
-              'tp'
-          )
+          AND status IN ('pending', 'accepted', 'tp')
         ORDER BY id DESC
         LIMIT 1
-    """, (
-        withdrawal_id,
-        club_number
-    )).fetchone()
+    """, (withdrawal_id, club_number)).fetchone()
 
     if not row:
         return "free"
-
     if row["status"] == "accepted":
         return "accepted"
-
     if row["status"] == "tp":
         return "tp"
-
     return "pending"
 
 
-def withdrawal_text(
-    club1,
-    club2,
-    status1,
-    status2
-):
+def withdrawal_text(club1, club2, status1, status2):
 
     symbol1 = "✅" if status1 == "accepted" else "❌"
     symbol2 = "✅" if status2 == "accepted" else "❌"
@@ -605,238 +648,322 @@ def withdrawal_text(
     )
 
 
-# ============================================================
-# ОТПИСКА — КНОПКИ
-# ============================================================
-
-def withdrawal_keyboard(
-    withdrawal_id,
-    club1,
-    club2
-):
-
-    status1 = get_club_status(
-        withdrawal_id,
-        1
-    )
-
-    status2 = get_club_status(
-        withdrawal_id,
-        2
-    )
+def withdrawal_keyboard(withdrawal_id, club1, club2):
 
     buttons = []
 
-    # --------------------------------------------------------
-    # КЛУБ 1
-    # --------------------------------------------------------
+    for number, club in ((1, club1), (2, club2)):
 
-    if status1 == "accepted":
+        status = get_club_status(withdrawal_id, number)
 
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"✅ {club1}",
-                callback_data="already_done"
-            )
-        ])
+        if status == "accepted":
+            buttons.append([InlineKeyboardButton(
+                text=f"✅ {club}", callback_data="already_done"
+            )])
 
-    elif status1 == "tp":
+        elif status == "tp":
+            buttons.append([InlineKeyboardButton(
+                text=f"⚠️ {club} — ТП", callback_data="already_done"
+            )])
 
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"⚠️ {club1} — ТП",
-                callback_data="already_done"
-            )
-        ])
+        else:
+            buttons.append([InlineKeyboardButton(
+                text=f"⚽ Отписаться — {club}",
+                callback_data=f"withdraw:{withdrawal_id}:{number}"
+            )])
 
-    else:
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"⚽ Отписаться — {club1}",
-                callback_data=f"withdraw:{withdrawal_id}:1"
-            )
-        ])
 
-    # --------------------------------------------------------
-    # КЛУБ 2
-    # --------------------------------------------------------
+def withdrawal_admin_keyboard(request_id):
 
-    if status2 == "accepted":
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_withdraw:{request_id}"),
+        InlineKeyboardButton(text="❌ Отказать", callback_data=f"reject_withdraw:{request_id}"),
+    ]])
 
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"✅ {club2}",
-                callback_data="already_done"
-            )
-        ])
 
-    elif status2 == "tp":
+def processed_withdrawal_keyboard(accepted):
+    return done_keyboard("✅" if accepted else "❌")
 
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"⚠️ {club2} — ТП",
-                callback_data="already_done"
-            )
-        ])
 
-    else:
+def question_admin_keyboard(question_id):
 
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"⚽ Отписаться — {club2}",
-                callback_data=f"withdraw:{withdrawal_id}:2"
-            )
-        ])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Ответить", callback_data=f"answer_question:{question_id}")],
+        [InlineKeyboardButton(text="❌ Закрыть", callback_data=f"close_question:{question_id}")],
+    ])
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=buttons
-    )
+
+@dp.callback_query(F.data == "already_done")
+async def already_done(callback: CallbackQuery):
+    await callback.answer("Уже обработано.", show_alert=True)
 
 
 # ============================================================
-# ADMIN REQUEST BUTTONS
+# ROBLOX
 # ============================================================
 
-def withdrawal_admin_keyboard(
-    request_id
-):
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✅ Принять",
-                    callback_data=f"accept_withdraw:{request_id}"
-                ),
-                InlineKeyboardButton(
-                    text="❌ Отказать",
-                    callback_data=f"reject_withdraw:{request_id}"
-                )
-            ]
-        ]
-    )
+ROBLOX_NICK_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 
 
-def processed_withdrawal_keyboard(
-    accepted
-):
+async def fetch_roblox_user(nick: str):
+    """
+    Возвращает (status, info):
+      ("ok", {"id", "name", "display", "image"})
+      ("notfound", None)
+      ("error", None)
+    """
+    timeout = aiohttp.ClientTimeout(total=10)
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✅" if accepted else "❌",
-                    callback_data="already_done"
-                )
-            ]
-        ]
-    )
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
 
+            async with session.post(
+                "https://users.roblox.com/v1/usernames/users",
+                json={"usernames": [nick], "excludeBannedUsers": False},
+            ) as resp:
+                if resp.status != 200:
+                    return "error", None
+                data = await resp.json()
 
-# ============================================================
-# QUESTION BUTTONS
-# ============================================================
+            items = data.get("data") or []
+            if not items:
+                return "notfound", None
 
-def question_admin_keyboard(
-    question_id
-):
+            found = items[0]
+            roblox_id = found["id"]
+            image_url = None
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="💬 Ответить",
-                    callback_data=f"answer_question:{question_id}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="❌ Закрыть",
-                    callback_data=f"close_question:{question_id}"
-                )
-            ]
-        ]
-    )
+            # Картинка иногда готовится не сразу — пробуем до 3 раз
+            for _ in range(3):
+                async with session.get(
+                    "https://thumbnails.roblox.com/v1/users/avatar",
+                    params={
+                        "userIds": roblox_id,
+                        "size": "420x420",
+                        "format": "Png",
+                        "isCircular": "false",
+                    },
+                ) as resp:
+                    if resp.status == 200:
+                        thumbs = (await resp.json()).get("data") or []
+                        if (
+                            thumbs
+                            and thumbs[0].get("state") == "Completed"
+                            and thumbs[0].get("imageUrl")
+                        ):
+                            image_url = thumbs[0]["imageUrl"]
+                            break
+                await asyncio.sleep(1)
 
+            return "ok", {
+                "id": roblox_id,
+                "name": found.get("name", nick),
+                "display": found.get("displayName"),
+                "image": image_url,
+            }
 
-# ============================================================
-# SIMPLE PROCESSED
-# ============================================================
-
-@dp.callback_query(
-    F.data == "already_done"
-)
-async def already_done(
-    callback: CallbackQuery
-):
-
-    await callback.answer(
-        "Уже обработано.",
-        show_alert=True
-    )
+    except Exception as e:
+        logging.warning("Ошибка запроса к Roblox: %s", e)
+        return "error", None
 
 
 # ============================================================
-# START
+# START + РЕГИСТРАЦИЯ ПО НИКУ ROBLOX
 # ============================================================
 
-@dp.message(
-    Command("start")
-)
-async def start_handler(
-    message: Message,
-    state: FSMContext
-):
+@dp.message(Command("start"))
+async def start_handler(message: Message, state: FSMContext):
 
     await state.clear()
 
+    if message.chat.type != "private":
+        return
+
     save_user(message)
+    user_id = message.from_user.id
+
+    # Уже зарегистрирован -> всегда сразу меню
+    if is_verified(user_id):
+        await message.answer(
+            "✦ <b>SL27 LEAGUE</b> ✦\n\n"
+            "Добро пожаловать!\n\n"
+            "Выберите раздел:",
+            reply_markup=await main_menu_for(user_id)
+        )
+        return
+
+    await state.set_state(UserState.waiting_roblox_nick)
 
     await message.answer(
         "✦ <b>SL27 LEAGUE</b> ✦\n\n"
         "Добро пожаловать!\n\n"
-        "Выберите раздел:",
-        reply_markup=main_menu()
+        "🎮 Для начала напишите ваш <b>ник в Roblox</b>:"
     )
 
 
+@dp.message(UserState.waiting_roblox_nick)
+async def receive_roblox_nick(message: Message, state: FSMContext):
+
+    save_user(message)
+
+    if not message.text:
+        await message.answer("❌ Отправьте ник текстом.")
+        return
+
+    nick = message.text.strip().lstrip("@")
+
+    if not ROBLOX_NICK_RE.match(nick):
+        await message.answer(
+            "❌ Некорректный ник.\n\n"
+            "Ник в Roblox — 3–20 символов: латиница, цифры и _.\n"
+            "Попробуйте ещё раз:"
+        )
+        return
+
+    wait = await message.answer("🔎 Ищу игрока в Roblox...")
+
+    status, info = await fetch_roblox_user(nick)
+
+    try:
+        await wait.delete()
+    except Exception:
+        pass
+
+    if status == "error":
+        await message.answer(
+            "⚠️ Не удалось связаться с Roblox. Попробуйте ещё раз чуть позже."
+        )
+        return
+
+    if status == "notfound":
+        await message.answer(
+            f"❌ Игрок <b>{safe(nick)}</b> не найден в Roblox.\n\n"
+            "Проверьте ник и отправьте его ещё раз:"
+        )
+        return
+
+    await state.set_state(UserState.waiting_roblox_confirm)
+    await state.update_data(rb_id=info["id"], rb_name=info["name"])
+
+    caption = (
+        "🎮 <b>Найден аккаунт Roblox</b>\n\n"
+        f"👤 Ник: <b>{safe(info['name'])}</b>\n"
+    )
+
+    if info["display"] and info["display"] != info["name"]:
+        caption += f"✨ Отображаемое имя: {safe(info['display'])}\n"
+
+    caption += "\n<b>Это вы?</b>"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Да", callback_data="rbx_yes"),
+        InlineKeyboardButton(text="❌ Нет", callback_data="rbx_no"),
+    ]])
+
+    if info["image"]:
+        try:
+            await message.answer_photo(info["image"], caption=caption, reply_markup=kb)
+            return
+        except Exception as e:
+            logging.warning("Не удалось отправить аватар: %s", e)
+
+    await message.answer(caption, reply_markup=kb)
+
+
+@dp.callback_query(F.data.in_({"rbx_yes", "rbx_no"}))
+async def roblox_confirm(callback: CallbackQuery, state: FSMContext):
+
+    save_callback_user(callback)
+
+    if await state.get_state() != UserState.waiting_roblox_confirm.state:
+        await callback.answer(
+            "⚠️ Сессия устарела. Напишите /start",
+            show_alert=True
+        )
+        return
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    # ---------------- НЕТ ----------------
+
+    if callback.data == "rbx_no":
+
+        await state.set_state(UserState.waiting_roblox_nick)
+
+        await callback.message.answer(
+            "🎮 Хорошо, отправьте ваш ник в Roblox ещё раз:"
+        )
+        await callback.answer()
+        return
+
+    # ---------------- ДА ----------------
+
+    data = await state.get_data()
+    rb_id = data.get("rb_id")
+    rb_name = data.get("rb_name")
+
+    if not rb_id or not rb_name:
+        await state.clear()
+        await callback.answer("⚠️ Ошибка. Напишите /start", show_alert=True)
+        return
+
+    # Один аккаунт Roblox = один Telegram
+    other = cur.execute("""
+        SELECT user_id FROM users
+        WHERE roblox_id = ? AND verified = 1 AND user_id != ?
+    """, (rb_id, callback.from_user.id)).fetchone()
+
+    if other:
+        await state.clear()
+        await callback.message.answer(
+            "❌ Этот аккаунт Roblox уже привязан к другому пользователю.\n\n"
+            "Если это ошибка — обратитесь к администрации."
+        )
+        await callback.answer()
+        return
+
+    cur.execute("""
+        UPDATE users
+        SET roblox_nick = ?, roblox_id = ?, verified = 1
+        WHERE user_id = ?
+    """, (rb_name, rb_id, callback.from_user.id))
+    db.commit()
+
+    await state.clear()
+
+    await callback.message.answer(
+        "✅ <b>Регистрация завершена!</b>\n\n"
+        f"🎮 Roblox: <b>{safe(rb_name)}</b>\n\n"
+        "✦ <b>SL27 LEAGUE</b> ✦\n"
+        "Выберите раздел:",
+        reply_markup=await main_menu_for(callback.from_user.id)
+    )
+
+    await callback.answer()
+
+
 # ============================================================
-# MYID
+# MYID / ADMIN / CANCEL / HELP
 # ============================================================
 
-@dp.message(
-    Command("myid")
-)
-async def myid_handler(
-    message: Message
-):
-
+@dp.message(Command("myid"))
+async def myid_handler(message: Message):
     await message.answer(
         "🆔 <b>Ваш Telegram ID:</b>\n\n"
         f"<code>{message.from_user.id}</code>"
     )
 
 
-# ============================================================
-# ADMIN
-# ============================================================
+@dp.message(Command("admin"))
+async def admin_handler(message: Message):
 
-@dp.message(
-    Command("admin")
-)
-async def admin_handler(
-    message: Message
-):
-
-    if not await is_admin(
-        message.from_user.id
-    ):
-
-        await message.answer(
-            "❌ У вас нет доступа."
-        )
-
+    if not await is_admin(message.from_user.id):
+        await message.answer("❌ У вас нет доступа.")
         return
 
     await message.answer(
@@ -847,90 +974,77 @@ async def admin_handler(
     )
 
 
-# ============================================================
-# CANCEL
-# ============================================================
-
-@dp.message(
-    Command("cancel")
-)
-async def cancel_handler(
-    message: Message,
-    state: FSMContext
-):
+@dp.message(Command("cancel"))
+async def cancel_handler(message: Message, state: FSMContext):
 
     await state.clear()
+
+    if not is_verified(message.from_user.id):
+        await message.answer(
+            "❌ Действие отменено.\n\nДля регистрации нажмите /start"
+        )
+        return
 
     await message.answer(
         "❌ Действие отменено.",
-        reply_markup=main_menu()
+        reply_markup=await main_menu_for(message.from_user.id)
     )
 
 
-# ============================================================
-# HELP
-# ============================================================
+@dp.message(Command("help"))
+async def help_handler(message: Message):
 
-@dp.message(
-    Command("help")
-)
-async def help_handler(
-    message: Message
-):
+    user_id = message.from_user.id
 
-    await message.answer(
-        "ℹ️ <b>SL27 BOT</b>\n\n"
-        "/start — главное меню\n"
-        "/myid — ваш ID\n"
-        "/admin — админ-панель\n"
-        "/cancel — отменить действие\n"
-        "/help — помощь"
-    )
+    lines = [
+        "ℹ️ <b>SL27 BOT</b>\n",
+        "/start — главное меню",
+        "/myid — ваш ID",
+        "/clubs — список клубов",
+        "/cancel — отменить действие",
+        "/help — помощь",
+    ]
+
+    if get_owned_club(user_id):
+        lines += [
+            "",
+            "👑 <b>Владелец клуба:</b>",
+            "/sign ник — предложить контракт игроку",
+            "/release ник — отпустить игрока из клуба",
+        ]
+
+    if await is_admin(user_id):
+        lines += [
+            "",
+            "🔧 <b>Админ:</b>",
+            "/admin — админ-панель",
+            "/giveclub ник | клуб — выдать клуб игроку",
+            "/takeclub ник или клуб — снять владельца",
+            "/unlink ник — сбросить привязку Roblox",
+        ]
+
+    await message.answer("\n".join(lines))
 
 
-# ============================================================
-# BACK MAIN
-# ============================================================
-
-@dp.callback_query(
-    F.data == "back_main"
-)
-async def back_main(
-    callback: CallbackQuery,
-    state: FSMContext
-):
+@dp.callback_query(F.data == "back_main")
+async def back_main(callback: CallbackQuery, state: FSMContext):
 
     await state.clear()
 
-    await callback.message.edit_text(
-        "✦ <b>SL27 LEAGUE</b> ✦\n\n"
-        "Выберите раздел:",
-        reply_markup=main_menu()
+    await show_screen(
+        callback,
+        "✦ <b>SL27 LEAGUE</b> ✦\n\nВыберите раздел:",
+        await main_menu_for(callback.from_user.id)
     )
 
     await callback.answer()
 
 
-# ============================================================
-# ADMIN MENU
-# ============================================================
+@dp.callback_query(F.data == "menu_admin")
+async def menu_admin(callback: CallbackQuery):
 
-@dp.callback_query(
-    F.data == "menu_admin"
-)
-async def menu_admin(
-    callback: CallbackQuery
-):
-
-    if not await is_admin(
-        callback.from_user.id
-    ):
-
-        await callback.answer(
-            "❌ Нет доступа.",
-            show_alert=True
-        )
-
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет доступа.", show_alert=True)
         return
 
     await callback.message.edit_text(
@@ -941,2684 +1055,3 @@ async def menu_admin(
     )
 
     await callback.answer()
-
-
-# ============================================================
-# SCHEDULE VIEW
-# ============================================================
-
-@dp.callback_query(
-    F.data == "menu_schedule"
-)
-async def menu_schedule(
-    callback: CallbackQuery
-):
-
-    row = cur.execute("""
-        SELECT text
-        FROM schedules
-        ORDER BY id DESC
-        LIMIT 1
-    """).fetchone()
-
-    if row:
-
-        text = (
-            "╭──── ✦ <b>SCHEDULE</b> ✦ ────╮\n\n"
-            f"{safe(row['text'])}\n\n"
-            "╰──────────────────────────╯"
-        )
-
-    else:
-
-        text = (
-            "📅 <b>РАСПИСАНИЕ</b>\n\n"
-            "Расписание пока отсутствует."
-        )
-
-    await callback.message.edit_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="⬅️ Назад",
-                        callback_data="back_main"
-                    )
-                ]
-            ]
-        )
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# ADMIN SCHEDULE
-# ============================================================
-
-@dp.callback_query(
-    F.data == "admin_schedule"
-)
-async def admin_schedule_start(
-    callback: CallbackQuery,
-    state: FSMContext
-):
-
-    if not await is_admin(
-        callback.from_user.id
-    ):
-
-        await callback.answer(
-            "❌ Нет доступа.",
-            show_alert=True
-        )
-
-        return
-
-    await state.set_state(
-        AdminState.waiting_schedule
-    )
-
-    await callback.message.answer(
-        "📅 Отправьте новое расписание.\n\n"
-        "Старое будет заменено.\n\n"
-        "/cancel — отмена"
-    )
-
-    await callback.answer()
-
-
-@dp.message(
-    AdminState.waiting_schedule
-)
-async def admin_schedule_save(
-    message: Message,
-    state: FSMContext
-):
-
-    if not await is_admin(
-        message.from_user.id
-    ):
-
-        await state.clear()
-        return
-
-    if not message.text:
-
-        await message.answer(
-            "❌ Отправьте расписание текстом."
-        )
-
-        return
-
-    cur.execute(
-        "DELETE FROM schedules"
-    )
-
-    cur.execute("""
-        INSERT INTO schedules (
-            text,
-            created_at
-        )
-        VALUES (?, ?)
-    """, (
-        message.text,
-        now_string()
-    ))
-
-    db.commit()
-
-    await state.clear()
-
-    await message.answer(
-        "✅ Расписание обновлено.",
-        reply_markup=admin_menu()
-    )
-
-
-# ============================================================
-# RESULTS VIEW
-# ============================================================
-
-@dp.callback_query(
-    F.data == "menu_results"
-)
-async def menu_results(
-    callback: CallbackQuery
-):
-
-    rows = cur.execute("""
-        SELECT text
-        FROM results
-        ORDER BY id DESC
-        LIMIT 10
-    """).fetchall()
-
-    if not rows:
-
-        text = (
-            "╭──── ✦ <b>RESULTS</b> ✦ ────╮\n\n"
-            "Результатов пока нет.\n\n"
-            "╰─────────────────────────╯"
-        )
-
-    else:
-
-        parts = [
-            "╭──── ✦ <b>RESULTS</b> ✦ ────╮",
-            ""
-        ]
-
-        for row in rows:
-
-            parts.append(
-                f"⚽ {safe(row['text'])}"
-            )
-
-        parts.extend([
-            "",
-            "╰─────────────────────────╯"
-        ])
-
-        text = "\n".join(parts)
-
-    await callback.message.edit_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="⬅️ Назад",
-                        callback_data="back_main"
-                    )
-                ]
-            ]
-        )
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# ADMIN RESULT
-# ============================================================
-
-@dp.callback_query(
-    F.data == "admin_result"
-)
-async def admin_result_start(
-    callback: CallbackQuery,
-    state: FSMContext
-):
-
-    if not await is_admin(
-        callback.from_user.id
-    ):
-
-        await callback.answer(
-            "❌ Нет доступа.",
-            show_alert=True
-        )
-
-        return
-
-    await state.set_state(
-        AdminState.waiting_result
-    )
-
-    await callback.message.answer(
-        "📊 Отправьте результат матча текстом.\n\n"
-        "Например:\n"
-        "<code>Al_Nassr 3:1 Netherlands</code>\n\n"
-        "/cancel — отмена"
-    )
-
-    await callback.answer()
-
-
-@dp.message(
-    AdminState.waiting_result
-)
-async def admin_result_save(
-    message: Message,
-    state: FSMContext
-):
-
-    if not await is_admin(
-        message.from_user.id
-    ):
-
-        await state.clear()
-        return
-
-    if not message.text:
-
-        await message.answer(
-            "❌ Отправьте результат текстом."
-        )
-
-        return
-
-    result = message.text.strip()
-
-    cur.execute("""
-        INSERT INTO results (
-            text,
-            created_at
-        )
-        VALUES (?, ?)
-    """, (
-        result,
-        now_string()
-    ))
-
-    db.commit()
-
-    try:
-
-        await bot.send_message(
-            OFFICIAL_CHANNEL_ID,
-            (
-                "╭──── ✦ <b>RESULT</b> ✦ ────╮\n\n"
-                f"⚽ <b>{safe(result)}</b>\n\n"
-                "╰─────────────────────────╯"
-            )
-        )
-
-        published = True
-
-    except Exception as e:
-
-        logging.error(
-            "Ошибка публикации результата: %s",
-            e
-        )
-
-        published = False
-
-    await state.clear()
-
-    await message.answer(
-        "✅ Результат опубликован."
-        if published
-        else
-        "✅ Результат сохранён, но в канал не отправлен.",
-        reply_markup=admin_menu()
-    )
-
-
-# ============================================================
-# MVP VIEW
-# ============================================================
-
-@dp.callback_query(
-    F.data == "menu_mvp"
-)
-async def menu_mvp(
-    callback: CallbackQuery
-):
-
-    row = cur.execute("""
-        SELECT text, photo_id
-        FROM mvps
-        ORDER BY id DESC
-        LIMIT 1
-    """).fetchone()
-
-    back = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data="back_main"
-                )
-            ]
-        ]
-    )
-
-    if not row:
-
-        await callback.message.edit_text(
-            "🏆 <b>MVP</b>\n\n"
-            "MVP пока не установлен.",
-            reply_markup=back
-        )
-
-        await callback.answer()
-        return
-
-    caption = (
-        "🏆 <b>MVP SL27</b>\n\n"
-        f"{safe(row['text'] or '')}"
-    )
-
-    if row["photo_id"]:
-
-        await callback.message.answer_photo(
-            row["photo_id"],
-            caption=caption,
-            reply_markup=back
-        )
-
-        try:
-            await callback.message.delete()
-        except Exception:
-            pass
-
-    else:
-
-        await callback.message.edit_text(
-            caption,
-            reply_markup=back
-        )
-
-    await callback.answer()
-
-
-# ============================================================
-# ADMIN MVP
-# ============================================================
-
-@dp.callback_query(
-    F.data == "admin_mvp"
-)
-async def admin_mvp_start(
-    callback: CallbackQuery,
-    state: FSMContext
-):
-
-    if not await is_admin(
-        callback.from_user.id
-    ):
-
-        await callback.answer(
-            "❌ Нет доступа.",
-            show_alert=True
-        )
-
-        return
-
-    await state.set_state(
-        AdminState.waiting_mvp
-    )
-
-    await callback.message.answer(
-        "🏆 Отправьте MVP текстом или фотографией.\n\n"
-        "/cancel — отмена"
-    )
-
-    await callback.answer()
-
-
-@dp.message(
-    AdminState.waiting_mvp,
-    F.photo
-)
-async def admin_mvp_photo(
-    message: Message,
-    state: FSMContext
-):
-
-    if not await is_admin(
-        message.from_user.id
-    ):
-
-        await state.clear()
-        return
-
-    photo_id = message.photo[-1].file_id
-
-    caption = (
-        message.caption
-        or
-        "MVP SL27"
-    )
-
-    cur.execute(
-        "DELETE FROM mvps"
-    )
-
-    cur.execute("""
-        INSERT INTO mvps (
-            text,
-            photo_id,
-            created_at
-        )
-        VALUES (?, ?, ?)
-    """, (
-        caption,
-        photo_id,
-        now_string()
-    ))
-
-    db.commit()
-
-    try:
-
-        await bot.send_photo(
-            OFFICIAL_CHANNEL_ID,
-            photo_id,
-            caption=(
-                "╭──── ✦ <b>MVP</b> ✦ ────╮\n\n"
-                f"🏆 <b>{safe(caption)}</b>\n\n"
-                "╰─────────────────────────╯"
-            )
-        )
-
-        published = True
-
-    except Exception:
-
-        published = False
-
-    await state.clear()
-
-    await message.answer(
-        "✅ MVP опубликован."
-        if published
-        else
-        "✅ MVP сохранён.",
-        reply_markup=admin_menu()
-    )
-
-
-@dp.message(
-    AdminState.waiting_mvp
-)
-async def admin_mvp_text(
-    message: Message,
-    state: FSMContext
-):
-
-    if not await is_admin(
-        message.from_user.id
-    ):
-
-        await state.clear()
-        return
-
-    if not message.text:
-
-        await message.answer(
-            "❌ Отправьте текст или фотографию."
-        )
-
-        return
-
-    value = message.text.strip()
-
-    cur.execute(
-        "DELETE FROM mvps"
-    )
-
-    cur.execute("""
-        INSERT INTO mvps (
-            text,
-            photo_id,
-            created_at
-        )
-        VALUES (?, NULL, ?)
-    """, (
-        value,
-        now_string()
-    ))
-
-    db.commit()
-
-    try:
-
-        await bot.send_message(
-            OFFICIAL_CHANNEL_ID,
-            (
-                "╭──── ✦ <b>MVP</b> ✦ ────╮\n\n"
-                f"🏆 <b>{safe(value)}</b>\n\n"
-                "╰─────────────────────────╯"
-            )
-        )
-
-        published = True
-
-    except Exception:
-
-        published = False
-
-    await state.clear()
-
-    await message.answer(
-        "✅ MVP опубликован."
-        if published
-        else
-        "✅ MVP сохранён.",
-        reply_markup=admin_menu()
-    )
-
-
-# ============================================================
-# PLAYER QUESTION
-# ============================================================
-
-@dp.callback_query(
-    F.data == "menu_question"
-)
-async def menu_question(
-    callback: CallbackQuery,
-    state: FSMContext
-):
-
-    await state.set_state(
-        UserState.waiting_question
-    )
-
-    await callback.message.answer(
-        "❓ <b>ВОПРОС АДМИНИСТРАЦИИ</b>\n\n"
-        "Напишите вопрос одним сообщением.\n\n"
-        "/cancel — отмена"
-    )
-
-    await callback.answer()
-
-
-@dp.message(
-    UserState.waiting_question
-)
-async def receive_question(
-    message: Message,
-    state: FSMContext
-):
-
-    save_user(message)
-
-    if not message.text:
-
-        await message.answer(
-            "❌ Отправьте вопрос текстом."
-        )
-
-        return
-
-    cur.execute("""
-        INSERT INTO questions (
-            user_id,
-            username,
-            question,
-            status,
-            created_at
-        )
-        VALUES (?, ?, ?, 'pending', ?)
-    """, (
-        message.from_user.id,
-        message.from_user.username,
-        message.text,
-        now_string()
-    ))
-
-    question_id = cur.lastrowid
-
-    db.commit()
-
-    name = get_user_name(
-        message.from_user
-    )
-
-    text = (
-        "╭──── ✦ <b>QUESTION</b> ✦ ────╮\n\n"
-        f"👤 {safe(name)}\n"
-        f"🆔 <code>{message.from_user.id}</code>\n\n"
-        f"💬 {safe(message.text)}\n\n"
-        "╰────────────────────────────╯"
-    )
-
-    try:
-
-        await bot.send_message(
-            ADMIN_GROUP_ID,
-            text,
-            reply_markup=question_admin_keyboard(
-                question_id
-            )
-        )
-
-        await message.answer(
-            "✅ Вопрос отправлен администраторам.",
-            reply_markup=main_menu()
-        )
-
-    except Exception as e:
-
-        logging.error(
-            "Question error: %s",
-            e
-        )
-
-        await message.answer(
-            "⚠️ Не удалось отправить вопрос."
-        )
-
-    await state.clear()
-
-
-# ============================================================
-# ADMIN QUESTIONS
-# ============================================================
-
-@dp.callback_query(
-    F.data == "admin_questions"
-)
-async def admin_questions(
-    callback: CallbackQuery
-):
-
-    if not await is_admin(
-        callback.from_user.id
-    ):
-
-        await callback.answer(
-            "❌ Нет доступа.",
-            show_alert=True
-        )
-
-        return
-
-    rows = cur.execute("""
-        SELECT
-            id,
-            user_id,
-            username,
-            question,
-            created_at
-        FROM questions
-        WHERE status = 'pending'
-        ORDER BY id ASC
-        LIMIT 20
-    """).fetchall()
-
-    if not rows:
-
-        await callback.message.answer(
-            "📭 Новых вопросов нет."
-        )
-
-        await callback.answer()
-        return
-
-    for row in rows:
-
-        name = (
-            f"@{row['username']}"
-            if row["username"]
-            else "без username"
-        )
-
-        await callback.message.answer(
-            (
-                "╭──── ✦ <b>QUESTION</b> ✦ ────╮\n\n"
-                f"👤 {safe(name)}\n"
-                f"🆔 <code>{row['user_id']}</code>\n\n"
-                f"💬 {safe(row['question'])}\n\n"
-                f"🕐 {row['created_at']}\n\n"
-                "╰────────────────────────────╯"
-            ),
-            reply_markup=question_admin_keyboard(
-                row["id"]
-            )
-        )
-
-    await callback.answer()
-
-
-# ============================================================
-# ANSWER QUESTION
-# ============================================================
-
-@dp.callback_query(
-    F.data.startswith("answer_question:")
-)
-async def answer_question_start(
-    callback: CallbackQuery,
-    state: FSMContext
-):
-
-    if not await is_admin(
-        callback.from_user.id
-    ):
-
-        await callback.answer(
-            "❌ Нет доступа.",
-            show_alert=True
-        )
-
-        return
-
-    try:
-
-        question_id = int(
-            callback.data.split(":")[1]
-        )
-
-    except Exception:
-
-        await callback.answer(
-            "❌ Ошибка вопроса.",
-            show_alert=True
-        )
-
-        return
-
-    row = cur.execute("""
-        SELECT status
-        FROM questions
-        WHERE id = ?
-    """, (
-        question_id,
-    )).fetchone()
-
-    if not row or row["status"] != "pending":
-
-        await callback.answer(
-            "⚠️ Вопрос уже обработан.",
-            show_alert=True
-        )
-
-        return
-
-    await state.set_state(
-        AdminState.waiting_question_answer
-    )
-
-    await state.update_data(
-        question_id=question_id
-    )
-
-    await callback.message.answer(
-        "💬 Напишите ответ игроку.\n\n"
-        "/cancel — отмена"
-    )
-
-    await callback.answer()
-
-
-@dp.message(
-    AdminState.waiting_question_answer
-)
-async def send_question_answer(
-    message: Message,
-    state: FSMContext
-):
-
-    if not await is_admin(
-        message.from_user.id
-    ):
-
-        await state.clear()
-        return
-
-    if not message.text:
-
-        await message.answer(
-            "❌ Ответ должен быть текстом."
-        )
-
-        return
-
-    data = await state.get_data()
-
-    question_id = data.get(
-        "question_id"
-    )
-
-    row = cur.execute("""
-        SELECT user_id
-        FROM questions
-        WHERE id = ?
-          AND status = 'pending'
-    """, (
-        question_id,
-    )).fetchone()
-
-    if not row:
-
-        await state.clear()
-
-        await message.answer(
-            "❌ Вопрос уже обработан."
-        )
-
-        return
-
-    try:
-
-        await bot.send_message(
-            row["user_id"],
-            (
-                "╭──── ✦ <b>ADMIN</b> ✦ ────╮\n\n"
-                f"💬 {safe(message.text)}\n\n"
-                "╰─────────────────────────╯"
-            )
-        )
-
-    except Exception as e:
-
-        await message.answer(
-            f"⚠️ Не удалось отправить ответ:\n{safe(e)}"
-        )
-
-        await state.clear()
-        return
-
-    cur.execute("""
-        UPDATE questions
-        SET
-            answer = ?,
-            status = 'answered'
-        WHERE id = ?
-    """, (
-        message.text,
-        question_id
-    ))
-
-    db.commit()
-
-    await state.clear()
-
-    await message.answer(
-        "✅ Ответ отправлен.",
-        reply_markup=admin_menu()
-    )
-
-
-# ============================================================
-# CLOSE QUESTION
-# ============================================================
-
-@dp.callback_query(
-    F.data.startswith("close_question:")
-)
-async def close_question(
-    callback: CallbackQuery
-):
-
-    if not await is_admin(
-        callback.from_user.id
-    ):
-
-        await callback.answer(
-            "❌ Нет доступа.",
-            show_alert=True
-        )
-
-        return
-
-    try:
-
-        question_id = int(
-            callback.data.split(":")[1]
-        )
-
-    except Exception:
-
-        await callback.answer(
-            "❌ Ошибка.",
-            show_alert=True
-        )
-
-        return
-
-    cur.execute("""
-        UPDATE questions
-        SET status = 'closed'
-        WHERE id = ?
-    """, (
-        question_id,
-    ))
-
-    db.commit()
-
-    try:
-
-        await callback.message.edit_reply_markup(
-            reply_markup=None
-        )
-
-    except Exception:
-        pass
-
-    await callback.answer(
-        "✅ Закрыто."
-    )
-
-
-# ============================================================
-# CREATE WITHDRAWAL
-# ============================================================
-
-@dp.callback_query(
-    F.data == "admin_withdrawal"
-)
-async def admin_withdrawal_start(
-    callback: CallbackQuery,
-    state: FSMContext
-):
-
-    if not await is_admin(
-        callback.from_user.id
-    ):
-
-        await callback.answer(
-            "❌ Нет доступа.",
-            show_alert=True
-        )
-
-        return
-
-    await state.set_state(
-        AdminState.waiting_withdrawal
-    )
-
-    await callback.message.answer(
-        "📢 <b>СОЗДАНИЕ ОТПИСКИ</b>\n\n"
-        "Введите два клуба через <code>|</code>.\n\n"
-        "Пример:\n"
-        "<code>Al_Nassr|Netherlands</code>\n\n"
-        "Первый клуб получает 🔑 VIP.\n"
-        "Оба клуба должны отправить результат.\n\n"
-        f"⏱ На отписку: {WITHDRAWAL_TIMEOUT_MINUTES} минут\n"
-        f"⏱ На результат: {RESULT_TIMEOUT_HOURS} часов\n\n"
-        "/cancel — отмена"
-    )
-
-    await callback.answer()
-
-
-@dp.message(
-    AdminState.waiting_withdrawal
-)
-async def admin_withdrawal_create(
-    message: Message,
-    state: FSMContext
-):
-
-    if not await is_admin(
-        message.from_user.id
-    ):
-
-        await state.clear()
-        return
-
-    if not message.text or "|" not in message.text:
-
-        await message.answer(
-            "❌ Формат:\n"
-            "<code>Al_Nassr|Netherlands</code>"
-        )
-
-        return
-
-    parts = [
-        x.strip()
-        for x in message.text.split("|")
-        if x.strip()
-    ]
-
-    if len(parts) != 2:
-
-        await message.answer(
-            "❌ Нужно ровно два клуба."
-        )
-
-        return
-
-    club1 = parts[0]
-    club2 = parts[1]
-
-    created = now_string()
-
-    cur.execute("""
-        INSERT INTO withdrawals (
-            club1,
-            club2,
-            status,
-            created_at
-        )
-        VALUES (?, ?, 'open', ?)
-    """, (
-        club1,
-        club2,
-        created
-    ))
-
-    withdrawal_id = cur.lastrowid
-
-    db.commit()
-
-    text = withdrawal_text(
-        club1,
-        club2,
-        "free",
-        "free"
-    )
-
-    try:
-
-        sent = await bot.send_message(
-            OFFICIAL_CHANNEL_ID,
-            text,
-            reply_markup=withdrawal_keyboard(
-                withdrawal_id,
-                club1,
-                club2
-            )
-        )
-
-        cur.execute("""
-            UPDATE withdrawals
-            SET channel_message_id = ?
-            WHERE id = ?
-        """, (
-            sent.message_id,
-            withdrawal_id
-        ))
-
-        db.commit()
-
-        await message.answer(
-            "✅ Отписка опубликована.",
-            reply_markup=admin_menu()
-        )
-
-    except Exception as e:
-
-        cur.execute("""
-            UPDATE withdrawals
-            SET status = 'error'
-            WHERE id = ?
-        """, (
-            withdrawal_id,
-        ))
-
-        db.commit()
-
-        await message.answer(
-            f"❌ Не удалось опубликовать:\n{safe(e)}"
-        )
-
-    await state.clear()
-
-
-# ============================================================
-# PLAYER CHOOSES CLUB
-#
-# ЛЮБОЙ ИГРОК МОЖЕТ НАЖАТЬ,
-# ЕСЛИ ЕГО ПРЕДЫДУЩУЮ ЗАЯВКУ ОТКЛОНИЛИ.
-#
-# Если клуб уже ПРИНЯТ — больше нажать нельзя.
-# ============================================================
-
-@dp.callback_query(
-    F.data.startswith("withdraw:")
-)
-async def player_choose_withdrawal(
-    callback: CallbackQuery
-):
-
-    save_callback_user(
-        callback
-    )
-
-    parts = callback.data.split(":")
-
-    if len(parts) != 3:
-
-        await callback.answer(
-            "❌ Ошибка.",
-            show_alert=True
-        )
-
-        return
-
-    try:
-
-        withdrawal_id = int(
-            parts[1]
-        )
-
-        club_number = int(
-            parts[2]
-        )
-
-    except Exception:
-
-        await callback.answer(
-            "❌ Ошибка заявки.",
-            show_alert=True
-        )
-
-        return
-
-    withdrawal = cur.execute("""
-        SELECT
-            id,
-            club1,
-            club2,
-            status,
-            created_at,
-            channel_message_id
-        FROM withdrawals
-        WHERE id = ?
-    """, (
-        withdrawal_id,
-    )).fetchone()
-
-    if not withdrawal:
-
-        await callback.answer(
-            "❌ Отписка не найдена.",
-            show_alert=True
-        )
-
-        return
-
-    if withdrawal["status"] != "open":
-
-        await callback.answer(
-            "❌ Эта отписка уже закрыта.",
-            show_alert=True
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # Проверяем 10 минут
-    # --------------------------------------------------------
-
-    created_at = parse_datetime(
-        withdrawal["created_at"]
-    )
-
-    if created_at:
-
-        deadline = (
-            created_at
-            + timedelta(
-                minutes=WITHDRAWAL_TIMEOUT_MINUTES
-            )
-        )
-
-        if now() >= deadline:
-
-            await callback.answer(
-                "⏱ Время на отписку уже закончилось.",
-                show_alert=True
-            )
-
-            return
-
-    if club_number == 1:
-
-        club = withdrawal["club1"]
-
-    elif club_number == 2:
-
-        club = withdrawal["club2"]
-
-    else:
-
-        await callback.answer(
-            "❌ Неверный клуб.",
-            show_alert=True
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # ЕСЛИ КЛУБ УЖЕ ПРИНЯТ
-    # --------------------------------------------------------
-
-    accepted = cur.execute("""
-        SELECT id
-        FROM withdrawal_players
-        WHERE withdrawal_id = ?
-          AND club_number = ?
-          AND status = 'accepted'
-        LIMIT 1
-    """, (
-        withdrawal_id,
-        club_number
-    )).fetchone()
-
-    if accepted:
-
-        await callback.answer(
-            "❌ Этот клуб уже принят за игроком.",
-            show_alert=True
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # ВАЖНО:
-    # НЕ ЗАПРЕЩАЕМ ИГРОКУ ПОВТОРНО ПОДАТЬ ЗАЯВКУ,
-    # ЕСЛИ ПРЕДЫДУЩУЮ ОТКЛОНИЛИ.
-    # --------------------------------------------------------
-
-    pending_same_user = cur.execute("""
-        SELECT id
-        FROM withdrawal_players
-        WHERE withdrawal_id = ?
-          AND user_id = ?
-          AND status = 'pending'
-        LIMIT 1
-    """, (
-        withdrawal_id,
-        callback.from_user.id
-    )).fetchone()
-
-    if pending_same_user:
-
-        await callback.answer(
-            "⏳ Ваша заявка уже рассматривается.",
-            show_alert=True
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # ЕСЛИ ЭТОТ ИГРОК БЫЛ REJECTED — МОЖЕТ НАЖАТЬ СНОВА
-    # --------------------------------------------------------
-
-    username = callback.from_user.username
-
-    cur.execute("""
-        INSERT INTO withdrawal_players (
-            withdrawal_id,
-            user_id,
-            username,
-            club,
-            club_number,
-            status,
-            stage,
-            created_at
-        )
-        VALUES (
-            ?, ?, ?, ?, ?,
-            'pending',
-            'pending',
-            ?
-        )
-    """, (
-        withdrawal_id,
-        callback.from_user.id,
-        username,
-        club,
-        club_number,
-        now_string()
-    ))
-
-    request_id = cur.lastrowid
-
-    db.commit()
-
-    player_name = get_user_name(
-        callback.from_user
-    )
-
-    admin_text = (
-        "╭──── ✦ <b>ОТПИСКА</b> ✦ ────╮\n\n"
-        f"👤 Игрок: <b>{safe(player_name)}</b>\n"
-        f"🆔 <code>{callback.from_user.id}</code>\n"
-        f"⚽ Клуб: <b>{safe(club)}</b>\n"
-        f"🔢 Клуб №{club_number}\n\n"
-        "Игрок хочет отписаться.\n\n"
-        "╰───────────────────────────╯"
-    )
-
-    try:
-
-        await bot.send_message(
-            ADMIN_GROUP_ID,
-            admin_text,
-            reply_markup=withdrawal_admin_keyboard(
-                request_id
-            )
-        )
-
-        await callback.answer(
-            "✅ Заявка отправлена администраторам.",
-            show_alert=True
-        )
-
-    except Exception as e:
-
-        logging.error(
-            "Ошибка отправки заявки: %s",
-            e
-        )
-
-        await callback.answer(
-            "⚠️ Не удалось отправить заявку.",
-            show_alert=True
-        )
-
-
-# ============================================================
-# ACCEPT WITHDRAWAL
-# ============================================================
-
-@dp.callback_query(
-    F.data.startswith("accept_withdraw:")
-)
-async def accept_withdraw(
-    callback: CallbackQuery
-):
-
-    if not await is_admin(
-        callback.from_user.id
-    ):
-
-        await callback.answer(
-            "❌ Нет доступа.",
-            show_alert=True
-        )
-
-        return
-
-    try:
-
-        request_id = int(
-            callback.data.split(":")[1]
-        )
-
-    except Exception:
-
-        await callback.answer(
-            "❌ Ошибка.",
-            show_alert=True
-        )
-
-        return
-
-    request = cur.execute("""
-        SELECT
-            wp.*,
-            w.club1,
-            w.club2,
-            w.channel_message_id,
-            w.status AS withdrawal_status
-        FROM withdrawal_players wp
-        JOIN withdrawals w
-            ON w.id = wp.withdrawal_id
-        WHERE wp.id = ?
-    """, (
-        request_id,
-    )).fetchone()
-
-    if not request:
-
-        await callback.answer(
-            "❌ Заявка не найдена.",
-            show_alert=True
-        )
-
-        return
-
-    if request["status"] != "pending":
-
-        await callback.answer(
-            "⚠️ Заявка уже обработана.",
-            show_alert=True
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # ЕСЛИ КЛУБ УЖЕ ПРИНЯЛИ ЗА ДРУГИМ
-    # --------------------------------------------------------
-
-    accepted_same_club = cur.execute("""
-        SELECT id
-        FROM withdrawal_players
-        WHERE withdrawal_id = ?
-          AND club_number = ?
-          AND status = 'accepted'
-          AND id != ?
-        LIMIT 1
-    """, (
-        request["withdrawal_id"],
-        request["club_number"],
-        request_id
-    )).fetchone()
-
-    if accepted_same_club:
-
-        cur.execute("""
-            UPDATE withdrawal_players
-            SET
-                status = 'rejected',
-                stage = 'rejected'
-            WHERE id = ?
-        """, (
-            request_id,
-        ))
-
-        db.commit()
-
-        try:
-
-            await bot.send_message(
-                request["user_id"],
-                (
-                    "❌ <b>Ваша заявка отклонена.</b>\n\n"
-                    f"⚽ Клуб: <b>{safe(request['club'])}</b>\n\n"
-                    "Клуб уже был принят за другим игроком."
-                )
-            )
-
-        except Exception:
-            pass
-
-        try:
-
-            await callback.message.edit_reply_markup(
-                reply_markup=processed_withdrawal_keyboard(
-                    False
-                )
-            )
-
-        except Exception:
-            pass
-
-        await callback.answer(
-            "❌ Клуб уже занят.",
-            show_alert=True
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # ПРИНИМАЕМ ЭТОГО ИГРОКА
-    # --------------------------------------------------------
-
-    accepted_at = now()
-
-    # --------------------------------------------------------
-    # КЛУБ 1 -> VIP
-    # --------------------------------------------------------
-
-    if request["club_number"] == 1:
-
-        stage = "waiting_vip"
-
-        result_deadline = None
-
-        player_message = (
-            "✅ <b>ОТПИСКА ПРИНЯТА</b>\n\n"
-            f"⚽ Клуб: <b>{safe(request['club'])}</b>\n\n"
-            "🔑 Отправьте VIP-ключ для игры.\n\n"
-            "Отправьте его обычным текстом."
-        )
-
-    # --------------------------------------------------------
-    # КЛУБ 2 -> СРАЗУ RESULT
-    # --------------------------------------------------------
-
-    else:
-
-        stage = "waiting_result"
-
-        result_deadline = (
-            accepted_at
-            + timedelta(
-                hours=RESULT_TIMEOUT_HOURS
-            )
-        ).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-
-        player_message = (
-            "✅ <b>ОТПИСКА ПРИНЯТА</b>\n\n"
-            f"⚽ Клуб: <b>{safe(request['club'])}</b>\n\n"
-            "🖼 Отправьте результат матча фотографией.\n\n"
-            f"⏱ У вас есть {RESULT_TIMEOUT_HOURS} часов."
-        )
-
-    cur.execute("""
-        UPDATE withdrawal_players
-        SET
-            status = 'accepted',
-            stage = ?,
-            accepted_at = ?,
-            result_deadline = ?
-        WHERE id = ?
-    """, (
-        stage,
-        accepted_at.strftime(
-            "%Y-%m-%d %H:%M:%S"
-        ),
-        result_deadline,
-        request_id
-    ))
-
-    # --------------------------------------------------------
-    # ОТКЛОНЯЕМ ОСТАЛЬНЫЕ PENDING ЗАЯВКИ
-    # ЭТОГО ЖЕ КЛУБА
-    # --------------------------------------------------------
-
-    others = cur.execute("""
-        SELECT
-            id,
-            user_id
-        FROM withdrawal_players
-        WHERE withdrawal_id = ?
-          AND club_number = ?
-          AND status = 'pending'
-          AND id != ?
-    """, (
-        request["withdrawal_id"],
-        request["club_number"],
-        request_id
-    )).fetchall()
-
-    for other in others:
-
-        cur.execute("""
-            UPDATE withdrawal_players
-            SET
-                status = 'rejected',
-                stage = 'rejected'
-            WHERE id = ?
-        """, (
-            other["id"],
-        ))
-
-        try:
-
-            await bot.send_message(
-                other["user_id"],
-                (
-                    "❌ <b>Ваша заявка не принята.</b>\n\n"
-                    f"⚽ Клуб: <b>{safe(request['club'])}</b>\n\n"
-                    "Другой игрок уже был принят на этот клуб."
-                )
-            )
-
-        except Exception:
-            pass
-
-    db.commit()
-
-    # --------------------------------------------------------
-    # ОБНОВЛЯЕМ КАНАЛ
-    # --------------------------------------------------------
-
-    status1 = get_club_status(
-        request["withdrawal_id"],
-        1
-    )
-
-    status2 = get_club_status(
-        request["withdrawal_id"],
-        2
-    )
-
-    if request["channel_message_id"]:
-
-        try:
-
-            await bot.edit_message_text(
-                chat_id=OFFICIAL_CHANNEL_ID,
-                message_id=request["channel_message_id"],
-                text=withdrawal_text(
-                    request["club1"],
-                    request["club2"],
-                    status1,
-                    status2
-                ),
-                reply_markup=withdrawal_keyboard(
-                    request["withdrawal_id"],
-                    request["club1"],
-                    request["club2"]
-                )
-            )
-
-        except Exception as e:
-
-            logging.warning(
-                "Ошибка обновления отписки в канале: %s",
-                e
-            )
-
-    # --------------------------------------------------------
-    # В АДМИН-ГРУППЕ
-    # ❌/2 КНОПКИ -> ✅
-    # --------------------------------------------------------
-
-    try:
-
-        await callback.message.edit_reply_markup(
-            reply_markup=processed_withdrawal_keyboard(
-                True
-            )
-        )
-
-    except Exception:
-        pass
-
-    # --------------------------------------------------------
-    # ЛС
-    # --------------------------------------------------------
-
-    try:
-
-        await bot.send_message(
-            request["user_id"],
-            player_message
-        )
-
-    except Exception as e:
-
-        logging.warning(
-            "Ошибка сообщения игроку: %s",
-            e
-        )
-
-    await callback.answer(
-        "✅ Заявка принята."
-    )
-
-
-# ============================================================
-# REJECT WITHDRAWAL
-# ============================================================
-
-@dp.callback_query(
-    F.data.startswith("reject_withdraw:")
-)
-async def reject_withdraw(
-    callback: CallbackQuery
-):
-
-    if not await is_admin(
-        callback.from_user.id
-    ):
-
-        await callback.answer(
-            "❌ Нет доступа.",
-            show_alert=True
-        )
-
-        return
-
-    try:
-
-        request_id = int(
-            callback.data.split(":")[1]
-        )
-
-    except Exception:
-
-        await callback.answer(
-            "❌ Ошибка.",
-            show_alert=True
-        )
-
-        return
-
-    request = cur.execute("""
-        SELECT
-            id,
-            user_id,
-            club,
-            withdrawal_id,
-            status
-        FROM withdrawal_players
-        WHERE id = ?
-    """, (
-        request_id,
-    )).fetchone()
-
-    if not request:
-
-        await callback.answer(
-            "❌ Заявка не найдена.",
-            show_alert=True
-        )
-
-        return
-
-    if request["status"] != "pending":
-
-        await callback.answer(
-            "⚠️ Уже обработано.",
-            show_alert=True
-        )
-
-        return
-
-    cur.execute("""
-        UPDATE withdrawal_players
-        SET
-            status = 'rejected',
-            stage = 'rejected'
-        WHERE id = ?
-    """, (
-        request_id,
-    ))
-
-    db.commit()
-
-    # --------------------------------------------------------
-    # ОТКАЗ — ИГРОК ПОТОМ СМОЖЕТ НАЖАТЬ ОПЯТЬ
-    # --------------------------------------------------------
-
-    try:
-
-        await bot.send_message(
-            request["user_id"],
-            (
-                "❌ <b>ОТПИСКА ОТКЛОНЕНА</b>\n\n"
-                f"⚽ Клуб: <b>{safe(request['club'])}</b>\n\n"
-                "Вы можете снова нажать кнопку отписки."
-            )
-        )
-
-    except Exception:
-        pass
-
-    # --------------------------------------------------------
-    # В АДМИНКЕ ОСТАЁТСЯ ❌
-    # --------------------------------------------------------
-
-    try:
-
-        await callback.message.edit_reply_markup(
-            reply_markup=processed_withdrawal_keyboard(
-                False
-            )
-        )
-
-    except Exception:
-        pass
-
-    await callback.answer(
-        "❌ Заявка отклонена."
-    )
-
-
-# ============================================================
-# ACTIVE PLAYER
-# ============================================================
-
-def get_active_player(
-    user_id
-):
-
-    return cur.execute("""
-        SELECT
-            wp.*,
-            w.club1,
-            w.club2
-        FROM withdrawal_players wp
-        JOIN withdrawals w
-            ON w.id = wp.withdrawal_id
-        WHERE wp.user_id = ?
-          AND wp.status = 'accepted'
-          AND wp.stage IN (
-              'waiting_vip',
-              'waiting_result'
-          )
-        ORDER BY wp.id DESC
-        LIMIT 1
-    """, (
-        user_id,
-    )).fetchone()
-
-
-# ============================================================
-# VIP
-#
-# Это STATE HANDLER.
-# Поэтому обычные сообщения без состояния
-# сюда НЕ ПОПАДАЮТ.
-# ============================================================
-
-@dp.message(
-    UserState.waiting_vip
-)
-async def receive_vip(
-    message: Message,
-    state: FSMContext
-):
-
-    if not message.text:
-
-        await message.answer(
-            "❌ VIP нужно отправить текстом."
-        )
-
-        return
-
-    player = get_active_player(
-        message.from_user.id
-    )
-
-    if not player:
-
-        await state.clear()
-
-        return
-
-    if player["stage"] != "waiting_vip":
-
-        await state.clear()
-
-        return
-
-    # Только клуб 1
-    if player["club_number"] != 1:
-
-        await state.clear()
-
-        return
-
-    vip_text = message.text.strip()
-
-    if not vip_text:
-
-        await message.answer(
-            "❌ VIP не может быть пустой."
-        )
-
-        return
-
-    # Сохраняем VIP
-    cur.execute("""
-        INSERT INTO submissions (
-            user_id,
-            club,
-            submission_type,
-            text,
-            photo_id,
-            caption,
-            status,
-            created_at
-        )
-        VALUES (
-            ?, ?, 'vip',
-            ?, NULL, NULL, 'sent', ?
-        )
-    """, (
-        message.from_user.id,
-        player["club"],
-        vip_text,
-        now_string()
-    ))
-
-    # Теперь ждём результат 5 часов
-    result_deadline = (
-        now()
-        + timedelta(
-            hours=RESULT_TIMEOUT_HOURS
-        )
-    ).strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
-
-    cur.execute("""
-        UPDATE withdrawal_players
-        SET
-            stage = 'waiting_result',
-            vip_sent_at = ?,
-            result_deadline = ?
-        WHERE id = ?
-    """, (
-        now_string(),
-        result_deadline,
-        player["id"]
-    ))
-
-    db.commit()
-
-    # --------------------------------------------------------
-    # VIP В АДМИН-ГРУППУ
-    # --------------------------------------------------------
-
-    admin_text = (
-        "╭────── ✦ <b>VIP</b> ✦ ──────╮\n\n"
-        f"👤 Игрок: <b>{safe(get_user_name(message.from_user))}</b>\n"
-        f"🆔 <code>{message.from_user.id}</code>\n"
-        f"⚽ Клуб: <b>{safe(player['club'])}</b>\n\n"
-        f"🔑 <b>VIP:</b>\n"
-        f"{safe(vip_text)}\n\n"
-        "╰───────────────────────────╯"
-    )
-
-    try:
-
-        await bot.send_message(
-            ADMIN_GROUP_ID,
-            admin_text
-        )
-
-    except Exception as e:
-
-        logging.error(
-            "Ошибка отправки VIP в группу: %s",
-            e
-        )
-
-    # --------------------------------------------------------
-    # СЛЕДУЮЩИЙ ЭТАП
-    # --------------------------------------------------------
-
-    await state.clear()
-
-    await message.answer(
-        "✅ VIP отправлена администраторам.\n\n"
-        "🖼 Теперь отправьте результат матча фотографией.\n\n"
-        f"⏱ На результат: {RESULT_TIMEOUT_HOURS} часов."
-    )
-
-
-# ============================================================
-# RESULT
-# ============================================================
-
-@dp.message(
-    UserState.waiting_result,
-    F.photo
-)
-async def receive_result_photo(
-    message: Message,
-    state: FSMContext
-):
-
-    player = get_active_player(
-        message.from_user.id
-    )
-
-    if not player:
-
-        await state.clear()
-        return
-
-    if player["stage"] != "waiting_result":
-
-        await state.clear()
-        return
-
-    photo_id = message.photo[-1].file_id
-
-    caption = (
-        message.caption
-        or ""
-    )
-
-    # Сохраняем result
-    cur.execute("""
-        INSERT INTO submissions (
-            user_id,
-            club,
-            submission_type,
-            text,
-            photo_id,
-            caption,
-            status,
-            created_at
-        )
-        VALUES (
-            ?, ?, 'result',
-            NULL, ?, ?, 'sent', ?
-        )
-    """, (
-        message.from_user.id,
-        player["club"],
-        photo_id,
-        caption,
-        now_string()
-    ))
-
-    # Результат получен
-    cur.execute("""
-        UPDATE withdrawal_players
-        SET
-            stage = 'completed',
-            result_sent = 1,
-            result_deadline = NULL
-        WHERE id = ?
-    """, (
-        player["id"],
-    ))
-
-    db.commit()
-
-    # --------------------------------------------------------
-    # RESULT В АДМИН-ГРУППУ
-    # --------------------------------------------------------
-
-    admin_caption = (
-        "╭──── ✦ <b>RESULT</b> ✦ ────╮\n\n"
-        f"👤 Игрок: <b>{safe(get_user_name(message.from_user))}</b>\n"
-        f"🆔 <code>{message.from_user.id}</code>\n"
-        f"⚽ Клуб: <b>{safe(player['club'])}</b>\n"
-    )
-
-    if caption:
-
-        admin_caption += (
-            f"\n📝 {safe(caption)}\n"
-        )
-
-    admin_caption += (
-        "\n╰───────────────────────────╯"
-    )
-
-    try:
-
-        await bot.send_photo(
-            ADMIN_GROUP_ID,
-            photo_id,
-            caption=admin_caption
-        )
-
-    except Exception as e:
-
-        logging.error(
-            "Ошибка отправки результата в группу: %s",
-            e
-        )
-
-    # Если есть подпись — сохраним её
-    if caption:
-
-        cur.execute("""
-            INSERT INTO results (
-                text,
-                created_at
-            )
-            VALUES (?, ?)
-        """, (
-            caption,
-            now_string()
-        ))
-
-        db.commit()
-
-    await state.clear()
-
-    await message.answer(
-        "✅ Результат отправлен администраторам."
-    )
-
-
-# ============================================================
-# RESULT, НО НЕ ФОТО
-# ============================================================
-
-@dp.message(
-    UserState.waiting_result
-)
-async def result_need_photo(
-    message: Message
-):
-
-    await message.answer(
-        "❌ Результат нужно отправить фотографией."
-    )
-
-
-# ============================================================
-# ADMIN POST
-# ============================================================
-
-@dp.callback_query(
-    F.data == "admin_post"
-)
-async def admin_post_start(
-    callback: CallbackQuery,
-    state: FSMContext
-):
-
-    if not await is_admin(
-        callback.from_user.id
-    ):
-
-        await callback.answer(
-            "❌ Нет доступа.",
-            show_alert=True
-        )
-
-        return
-
-    await state.set_state(
-        AdminState.waiting_post
-    )
-
-    await callback.message.answer(
-        "📣 Отправьте текст поста.\n\n"
-        "/cancel — отмена"
-    )
-
-    await callback.answer()
-
-
-@dp.message(
-    AdminState.waiting_post
-)
-async def admin_post_send(
-    message: Message,
-    state: FSMContext
-):
-
-    if not await is_admin(
-        message.from_user.id
-    ):
-
-        await state.clear()
-        return
-
-    if not message.text:
-
-        await message.answer(
-            "❌ Отправьте текст."
-        )
-
-        return
-
-    try:
-
-        await bot.send_message(
-            OFFICIAL_CHANNEL_ID,
-            message.text
-        )
-
-        await message.answer(
-            "✅ Пост опубликован.",
-            reply_markup=admin_menu()
-        )
-
-    except Exception as e:
-
-        await message.answer(
-            f"❌ Ошибка:\n{safe(e)}"
-        )
-
-    await state.clear()
-
-
-# ============================================================
-# 10 МИНУТ — ПРОВЕРКА ОТПИСОК
-# ============================================================
-
-async def check_withdrawal_timeouts():
-
-    rows = cur.execute("""
-        SELECT
-            id,
-            club1,
-            club2,
-            channel_message_id,
-            created_at,
-            status
-        FROM withdrawals
-        WHERE status = 'open'
-    """).fetchall()
-
-    for withdrawal in rows:
-
-        created_at = parse_datetime(
-            withdrawal["created_at"]
-        )
-
-        if not created_at:
-            continue
-
-        deadline = (
-            created_at
-            + timedelta(
-                minutes=WITHDRAWAL_TIMEOUT_MINUTES
-            )
-        )
-
-        if now() < deadline:
-            continue
-
-        tp_clubs = []
-
-        # ----------------------------------------------------
-        # CLUB 1
-        # ----------------------------------------------------
-
-        club1_accepted = cur.execute("""
-            SELECT id
-            FROM withdrawal_players
-            WHERE withdrawal_id = ?
-              AND club_number = 1
-              AND status = 'accepted'
-            LIMIT 1
-        """, (
-            withdrawal["id"],
-        )).fetchone()
-
-        if not club1_accepted:
-
-            # Если уже есть TP, не создаём второй
-            club1_tp = cur.execute("""
-                SELECT id
-                FROM withdrawal_players
-                WHERE withdrawal_id = ?
-                  AND club_number = 1
-                  AND status = 'tp'
-                LIMIT 1
-            """, (
-                withdrawal["id"],
-            )).fetchone()
-
-            if not club1_tp:
-
-                cur.execute("""
-                    INSERT INTO withdrawal_players (
-                        withdrawal_id,
-                        user_id,
-                        username,
-                        club,
-                        club_number,
-                        status,
-                        stage,
-                        tp_reason,
-                        created_at
-                    )
-                    VALUES (
-                        ?, 0, NULL, ?, 1,
-                        'tp',
-                        'tp',
-                        'withdrawal_timeout',
-                        ?
-                    )
-                """, (
-                    withdrawal["id"],
-                    withdrawal["club1"],
-                    now_string()
-                ))
-
-                tp_clubs.append(
-                    withdrawal["club1"]
-                )
-
-        # ----------------------------------------------------
-        # CLUB 2
-        # ----------------------------------------------------
-
-        club2_accepted = cur.execute("""
-            SELECT id
-            FROM withdrawal_players
-            WHERE withdrawal_id = ?
-              AND club_number = 2
-              AND status = 'accepted'
-            LIMIT 1
-        """, (
-            withdrawal["id"],
-        )).fetchone()
-
-        if not club2_accepted:
-
-            club2_tp = cur.execute("""
-                SELECT id
-                FROM withdrawal_players
-                WHERE withdrawal_id = ?
-                  AND club_number = 2
-                  AND status = 'tp'
-                LIMIT 1
-            """, (
-                withdrawal["id"],
-            )).fetchone()
-
-            if not club2_tp:
-
-                cur.execute("""
-                    INSERT INTO withdrawal_players (
-                        withdrawal_id,
-                        user_id,
-                        username,
-                        club,
-                        club_number,
-                        status,
-                        stage,
-                        tp_reason,
-                        created_at
-                    )
-                    VALUES (
-                        ?, 0, NULL, ?, 2,
-                        'tp',
-                        'tp',
-                        'withdrawal_timeout',
-                        ?
-                    )
-                """, (
-                    withdrawal["id"],
-                    withdrawal["club2"],
-                    now_string()
-                ))
-
-                tp_clubs.append(
-                    withdrawal["club2"]
-                )
-
-        db.commit()
-
-        # ----------------------------------------------------
-        # ОТПРАВЛЯЕМ В КАНАЛ ОДНО СООБЩЕНИЕ
-        # ----------------------------------------------------
-
-        if tp_clubs:
-
-            if len(tp_clubs) == 1:
-
-                clubs_text = (
-                    f"⚽ <b>{safe(tp_clubs[0])}</b>"
-                )
-
-            else:
-
-                clubs_text = (
-                    f"⚽ <b>{safe(tp_clubs[0])}</b>\n"
-                    f"⚽ <b>{safe(tp_clubs[1])}</b>"
-                )
-
-            try:
-
-                await bot.send_message(
-                    OFFICIAL_CHANNEL_ID,
-                    (
-                        "⚠️ <b>ТЕХНИЧЕСКОЕ ПОРАЖЕНИЕ</b>\n\n"
-                        "Клубы, которые не отписались:\n\n"
-                        f"{clubs_text}\n\n"
-                        "⏱ Время на отписку истекло."
-                    )
-                )
-
-            except Exception as e:
-
-                logging.error(
-                    "Ошибка TP сообщения: %s",
-                    e
-                )
-
-        # ----------------------------------------------------
-        # ОБНОВЛЯЕМ СТАТУС В КАНАЛЕ
-        # ----------------------------------------------------
-
-        status1 = get_club_status(
-            withdrawal["id"],
-            1
-        )
-
-        status2 = get_club_status(
-            withdrawal["id"],
-            2
-        )
-
-        if withdrawal["channel_message_id"]:
-
-            try:
-
-                await bot.edit_message_text(
-                    chat_id=OFFICIAL_CHANNEL_ID,
-                    message_id=withdrawal["channel_message_id"],
-                    text=withdrawal_text(
-                        withdrawal["club1"],
-                        withdrawal["club2"],
-                        status1,
-                        status2
-                    ),
-                    reply_markup=withdrawal_keyboard(
-                        withdrawal["id"],
-                        withdrawal["club1"],
-                        withdrawal["club2"]
-                    )
-                )
-
-            except Exception as e:
-
-                logging.warning(
-                    "Ошибка изменения канала: %s",
-                    e
-                )
-
-        # ----------------------------------------------------
-        # ЗАКРЫВАЕМ ОТПИСКУ
-        # ----------------------------------------------------
-
-        cur.execute("""
-            UPDATE withdrawals
-            SET status = 'closed'
-            WHERE id = ?
-        """, (
-            withdrawal["id"],
-        ))
-
-        db.commit()
-
-
-# ============================================================
-# 5 ЧАСОВ — ПРОВЕРКА РЕЗУЛЬТАТОВ
-# ============================================================
-
-async def check_result_timeouts():
-
-    rows = cur.execute("""
-        SELECT
-            wp.*,
-            w.club1,
-            w.club2
-        FROM withdrawal_players wp
-        JOIN withdrawals w
-            ON w.id = wp.withdrawal_id
-        WHERE wp.status = 'accepted'
-          AND wp.stage = 'waiting_result'
-          AND wp.result_sent = 0
-          AND wp.result_deadline IS NOT NULL
-    """).fetchall()
-
-    for row in rows:
-
-        deadline = parse_datetime(
-            row["result_deadline"]
-        )
-
-        if not deadline:
-            continue
-
-        if now() < deadline:
-            continue
-
-        # ----------------------------------------------------
-        # НЕ ОТПРАВИЛ РЕЗУЛЬТАТ -> ТП
-        # ----------------------------------------------------
-
-        cur.execute("""
-            UPDATE withdrawal_players
-            SET
-                status = 'tp',
-                stage = 'tp',
-                tp_reason = 'result_timeout',
-                result_deadline = NULL
-            WHERE id = ?
-              AND status = 'accepted'
-              AND result_sent = 0
-        """, (
-            row["id"],
-        ))
-
-        db.commit()
-
-        # ----------------------------------------------------
-        # КАНАЛ
-        # ----------------------------------------------------
-
-        try:
-
-            await bot.send_message(
-                OFFICIAL_CHANNEL_ID,
-                (
-                    "⚠️ <b>ТЕХНИЧЕСКОЕ ПОРАЖЕНИЕ</b>\n\n"
-                    f"⚽ <b>{safe(row['club'])}</b>\n\n"
-                    "Результат матча не был отправлен "
-                    f"за {RESULT_TIMEOUT_HOURS} часов."
-                )
-            )
-
-        except Exception as e:
-
-            logging.error(
-                "Ошибка TP результата: %s",
-                e
-            )
-
-        # ----------------------------------------------------
-        # ИГРОКУ
-        # ----------------------------------------------------
-
-        if row["user_id"] != 0:
-
-            try:
-
-                await bot.send_message(
-                    row["user_id"],
-                    (
-                        "⚠️ <b>ТЕХНИЧЕСКОЕ ПОРАЖЕНИЕ</b>\n\n"
-                        f"⚽ Клуб: <b>{safe(row['club'])}</b>\n\n"
-                        "Результат матча не был отправлен "
-                        f"за {RESULT_TIMEOUT_HOURS} часов."
-                    )
-                )
-
-            except Exception as e:
-
-                logging.warning(
-                    "Ошибка сообщения игроку: %s",
-                    e
-                )
-
-
-# ============================================================
-# ФОНОВЫЙ ТАЙМЕР
-# ============================================================
-
-async def deadline_checker():
-
-    while True:
-
-        try:
-
-            await check_withdrawal_timeouts()
-
-            await check_result_timeouts()
-
-        except Exception as e:
-
-            logging.exception(
-                "Ошибка таймера: %s",
-                e
-            )
-
-        await asyncio.sleep(10)
-
-
-# ============================================================
-# ВАЖНО:
-# ЗДЕСЬ НЕТ @dp.message() БЕЗ УСЛОВИЯ.
-#
-# Поэтому если игрок напишет:
-#
-# "привет"
-# "тест"
-# "123"
-#
-# БОТ НЕ БУДЕТ ОТВЕЧАТЬ.
-#
-# Бот реагирует только на:
-# /start
-# /myid
-# /admin
-# /cancel
-# /help
-# состояния FSM
-# кнопки
-# ============================================================
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-async def main():
-
-    if BOT_TOKEN == "ВСТАВЬТЕ_ТОКЕН_БОТА":
-
-        print()
-        print("=" * 60)
-        print("ОШИБКА: ВСТАВЬТЕ ТОКЕН В BOT_TOKEN")
-        print("=" * 60)
-        print()
-
-        return
-
-    print("=" * 60)
-    print("SL27 BOT ЗАПУЩЕН")
-    print(f"ADMIN GROUP: {ADMIN_GROUP_ID}")
-    print(f"OFFICIAL CHANNEL: {OFFICIAL_CHANNEL_ID}")
-    print("=" * 60)
-
-    # Убираем webhook
-    try:
-
-        await bot.delete_webhook(
-            drop_pending_updates=False
-        )
-
-    except Exception as e:
-
-        logging.warning(
-            "Ошибка удаления webhook: %s",
-            e
-        )
-
-    # Запускаем таймеры
-    asyncio.create_task(
-        deadline_checker()
-    )
-
-    # Запускаем бота
-    await dp.start_polling(
-        bot
-    )
-
-
-# ============================================================
-# RUN
-# ============================================================
-
-if __name__ == "__main__":
-
-    try:
-
-        asyncio.run(
-            main()
-        )
-
-    except KeyboardInterrupt:
-
-        print(
-            "\nБот остановлен."
-        )
-
-    except Exception as e:
-
-        logging.exception(
-            "Критическая ошибка: %s",
-            e
-        )
-
-    finally:
-
-        db.close()
